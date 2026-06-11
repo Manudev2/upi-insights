@@ -271,43 +271,103 @@ def _clean_paytm(df):
 
 
 def _clean_phonepe(df):
-    """Generic PhonePe XLSX/CSV handler"""
+    """PhonePe XLSX/CSV handler"""
+
+    df = df.copy()
+
+    # Remove duplicate columns
+    df = df.loc[:, ~df.columns.duplicated()]
+
     rename_map = {}
+
     for c in df.columns:
-        cl = c.strip().lower()
-        if 'date' in cl:
+
+        cl = str(c).strip().lower()
+
+        if cl == 'date':
             rename_map[c] = 'date_raw'
-        elif 'time' in cl:
+
+        elif cl == 'time':
             rename_map[c] = 'time_raw'
-        elif 'amount' in cl:
+
+        elif cl == 'amount':
             rename_map[c] = 'amount_raw'
-        elif 'remark' in cl or 'transaction' in cl or 'detail' in cl:
+
+        elif cl in [
+            'transaction',
+            'transaction details',
+            'details',
+            'remarks',
+            'remark'
+        ]:
             rename_map[c] = 'merchant'
-        elif 'type' in cl:
+
+        elif cl == 'type':
             rename_map[c] = 'txn_type_raw'
+
     df = df.rename(columns=rename_map)
 
-    df['amount'] = df['amount_raw'].apply(_parse_signed_amount).abs()
+    # Remove duplicates again after rename
+    df = df.loc[:, ~df.columns.duplicated()]
 
-    date_parsed = pd.to_datetime(df['date_raw'], errors='coerce', dayfirst=True)
+    if 'amount_raw' not in df.columns:
+        raise ValueError(
+            f"Amount column not found. Columns are: {list(df.columns)}"
+        )
+
+    if 'date_raw' not in df.columns:
+        raise ValueError(
+            f"Date column not found. Columns are: {list(df.columns)}"
+        )
+
+    if 'merchant' not in df.columns:
+        df['merchant'] = 'Unknown'
+
+    df['amount'] = (
+        df['amount_raw']
+        .apply(_parse_signed_amount)
+        .abs()
+    )
+
+    date_parsed = pd.to_datetime(
+        df['date_raw'],
+        errors='coerce',
+        dayfirst=True
+    )
+
     if 'time_raw' in df.columns:
+
         df['date'] = pd.to_datetime(
-            date_parsed.dt.strftime('%Y-%m-%d') + ' ' + df['time_raw'].astype(str),
+            date_parsed.dt.strftime('%Y-%m-%d')
+            + ' '
+            + df['time_raw'].astype(str),
             errors='coerce'
         )
+
         mask = df['date'].isna()
         df.loc[mask, 'date'] = date_parsed[mask]
+
     else:
         df['date'] = date_parsed
 
     if 'txn_type_raw' in df.columns:
-        df['txn_direction'] = df['txn_type_raw'].astype(str).apply(
-            lambda x: 'Credit' if 'credit' in x.lower() else 'Debit'
+
+        df['txn_direction'] = (
+            df['txn_type_raw']
+            .astype(str)
+            .apply(
+                lambda x:
+                'Credit'
+                if 'credit' in x.lower()
+                else 'Debit'
+            )
         )
+
     else:
         df['txn_direction'] = 'Debit'
 
     df['category'] = df['merchant'].apply(auto_categorize)
+
     return df
 
 
