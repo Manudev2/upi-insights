@@ -380,7 +380,19 @@ def _clean_pdf_generic(df):
 # ── Main cleaning entry point ──────────────────────────────────
 def clean_data(df, app_name):
     df = df.copy()
+
+    # Clean column names
     df.columns = [str(c).strip() for c in df.columns]
+
+    # Remove duplicate columns
+    df = df.loc[:, ~df.columns.duplicated()]
+
+    # Reset index
+    df = df.reset_index(drop=True)
+
+    # Debug (remove later)
+    print("APP:", app_name)
+    print("COLUMNS:", df.columns.tolist())
 
     if app_name == 'PDF':
         df = _clean_pdf_generic(df)
@@ -391,34 +403,69 @@ def clean_data(df, app_name):
     else:
         df = _clean_gpay(df)
 
+    # Remove duplicate columns again after renaming
+    df = df.loc[:, ~df.columns.duplicated()]
+    df = df.reset_index(drop=True)
+
+    # Required columns check
+    required_cols = ['date', 'amount']
+    for col in required_cols:
+        if col not in df.columns:
+            raise ValueError(f"Missing required column: {col}")
+
     df['date'] = pd.to_datetime(df['date'], errors='coerce')
+
     df = df.dropna(subset=['date', 'amount'])
     df = df[df['amount'] > 0]
 
-    df['hour']        = df['date'].dt.hour
+    df['hour'] = df['date'].dt.hour
     df['day_of_week'] = df['date'].dt.strftime('%A')
-    df['month']       = df['date'].dt.strftime('%B')
-    df['month_num']   = df['date'].dt.month
+    df['month'] = df['date'].dt.strftime('%B')
+    df['month_num'] = df['date'].dt.month
+
+    if 'merchant' not in df.columns:
+        df['merchant'] = 'Unknown'
 
     if 'category' not in df.columns or df['category'].isna().all():
         df['category'] = df['merchant'].apply(auto_categorize)
 
     if 'status' not in df.columns:
         df['status'] = 'Success'
+
     df['status'] = df['status'].fillna('Success')
 
     if 'transaction_id' not in df.columns:
-        df['transaction_id'] = [f'TXN{str(i).zfill(6)}' for i in range(len(df))]
+        df['transaction_id'] = [
+            f"TXN{str(i).zfill(6)}"
+            for i in range(len(df))
+        ]
 
-    Q1 = df['amount'].quantile(0.25)
-    Q3 = df['amount'].quantile(0.75)
-    IQR = Q3 - Q1
-    df['is_anomaly'] = df['amount'] > (Q3 + 3 * IQR)
+    if len(df) > 0:
+        Q1 = df['amount'].quantile(0.25)
+        Q3 = df['amount'].quantile(0.75)
+        IQR = Q3 - Q1
+        df['is_anomaly'] = df['amount'] > (Q3 + 3 * IQR)
+    else:
+        df['is_anomaly'] = False
 
-    keep_cols = ['transaction_id','date','hour','day_of_week','month','month_num',
-                  'amount','merchant','category','status','is_anomaly']
+    keep_cols = [
+        'transaction_id',
+        'date',
+        'hour',
+        'day_of_week',
+        'month',
+        'month_num',
+        'amount',
+        'merchant',
+        'category',
+        'status',
+        'is_anomaly'
+    ]
+
     if 'txn_direction' in df.columns:
         keep_cols.append('txn_direction')
+
+    keep_cols = [c for c in keep_cols if c in df.columns]
 
     return df[keep_cols].reset_index(drop=True)
 
