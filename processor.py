@@ -54,44 +54,72 @@ def detect_app(filename, df_or_sheets):
 
 # ── PDF extraction ───────────────────────────────────────────
 def _load_pdf(uploaded_file):
-    """Extract transaction-like rows from a PDF statement."""
-    rows = []
+    """
+    PhonePe / UPI PDF parser
+    """
+    transactions = []
+
     with pdfplumber.open(uploaded_file) as pdf:
+        text = ""
+
         for page in pdf.pages:
-            # 1. Try table extraction first
-            tables = page.extract_tables()
-            for table in tables:
-                if not table or len(table) < 2:
-                    continue
-                header = [str(h).strip().lower() if h else '' for h in table[0]]
-                for row in table[1:]:
-                    row_dict = {}
-                    for h, val in zip(header, row):
-                        row_dict[h] = val
-                    rows.append(row_dict)
+            page_text = page.extract_text()
+            if page_text:
+                text += page_text + "\n"
 
-            # 2. Fallback: text-line pattern matching (date + amount on same line)
-            if not tables:
-                text = page.extract_text() or ''
-                for line in text.split('\n'):
-                    m = re.search(
-                        r'(\d{1,2}[-/\s][A-Za-z0-9]{2,9}[-/\s]\d{2,4}).*?'
-                        r'([+-]?\u20b9?\s?[\d,]+\.\d{2})',
-                        line
-                    )
-                    if m:
-                        rows.append({
-                            'date': m.group(1),
-                            'transaction': line,
-                            'amount': m.group(2),
-                        })
+    lines = text.split("\n")
 
-    if not rows:
-        raise ValueError('Could not find any transaction table in this PDF.')
+    i = 0
+    while i < len(lines):
 
-    df = pd.DataFrame(rows)
-    df = df.dropna(how='all')
-    return df
+        line = lines[i].strip()
+
+        if re.match(r"^[A-Z][a-z]{2}\s\d{2},\s\d{4}$", line):
+
+            date = line
+            details = ""
+            txn_type = ""
+            amount = ""
+
+            j = i + 1
+
+            while j < len(lines):
+
+                curr = lines[j].strip()
+
+                if curr.startswith("Credit INR"):
+                    txn_type = "Credit"
+                    amount = curr.replace("Credit INR", "").strip()
+                    break
+
+                elif curr.startswith("Debit INR"):
+                    txn_type = "Debit"
+                    amount = curr.replace("Debit INR", "").strip()
+                    break
+
+                else:
+                    details += " " + curr
+
+                j += 1
+
+            if amount:
+                transactions.append({
+                    "date": date,
+                    "transaction": details.strip(),
+                    "type": txn_type,
+                    "amount": amount
+                })
+
+            i = j
+
+        i += 1
+
+    if not transactions:
+        raise ValueError(
+            "No transactions found. Please upload a valid PhonePe statement."
+        )
+
+    return pd.DataFrame(transactions)
 
 
 # ── File loading ─────────────────────────────────────────────
