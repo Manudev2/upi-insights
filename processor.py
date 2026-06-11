@@ -1,141 +1,429 @@
 import pandas as pd
 import numpy as np
+import pdfplumber
+import re
 
-def detect_app(df):
-    cols = [c.lower().strip() for c in df.columns]
-    if any('wallet' in c for c in cols):
+
+# ── Categorization ───────────────────────────────────────────
+def auto_categorize(text):
+    text = str(text).lower()
+    if any(k in text for k in ['zomato','swiggy','food','restaurant','cafe','pizza','burger','kfc','domino']):
+        return 'Food & Dining'
+    elif any(k in text for k in ['amazon','flipkart','myntra','shop','store','mall','meesho','ajio','shopping']):
+        return 'Shopping'
+    elif any(k in text for k in ['electricity','gas','water','bill','broadband','dth','recharge','airtel','jio','bsnl','vi']):
+        return 'Utilities & Recharge'
+    elif any(k in text for k in ['ola','uber','rapido','metro','irctc','bus','train','flight','travel','petrol']):
+        return 'Transport'
+    elif any(k in text for k in ['netflix','hotstar','spotify','bookmyshow','prime','zee','movie']):
+        return 'Entertainment'
+    elif any(k in text for k in ['bigbasket','blinkit','grocer','supermarket','dmart','zepto','instamart','vegetable']):
+        return 'Groceries'
+    elif any(k in text for k in ['apollo','pharmacy','hospital','doctor','medical','health','netmeds','1mg']):
+        return 'Healthcare'
+    elif any(k in text for k in ['udemy','coursera','byju','school','college','education','unacademy']):
+        return 'Education'
+    elif any(k in text for k in ['transfer','sent','received','self','neft','imps','emi','loan','atm']):
+        return 'Bank Transfer'
+    return 'Others'
+
+
+# ── App detection ─────────────────────────────────────────────
+def detect_app(filename, df_or_sheets):
+    fname = filename.lower()
+    if 'paytm' in fname:
         return 'Paytm'
-    elif any('receiver' in c for c in cols):
-        return 'GPay'
-    elif any('upi_id' in c for c in cols):
+    if 'phonepe' in fname:
         return 'PhonePe'
+    if 'gpay' in fname or 'google' in fname:
+        return 'GPay'
+
+    if isinstance(df_or_sheets, dict):
+        cols = []
+        for sheet_df in df_or_sheets.values():
+            cols += [c.lower() for c in sheet_df.columns]
+    else:
+        cols = [str(c).lower() for c in df_or_sheets.columns]
+
+    if 'tags' in cols or 'upi ref no.' in cols:
+        return 'Paytm'
+    if 'transaction' in cols and 'amount' in cols:
+        return 'GPay'
     return 'GPay'
 
+
+# ── PDF extraction ───────────────────────────────────────────
+def _load_pdf(uploaded_file):
+    """Extract transaction-like rows from a PDF statement."""
+    rows = []
+    with pdfplumber.open(uploaded_file) as pdf:
+        for page in pdf.pages:
+            # 1. Try table extraction first
+            tables = page.extract_tables()
+            for table in tables:
+                if not table or len(table) < 2:
+                    continue
+                header = [str(h).strip().lower() if h else '' for h in table[0]]
+                for row in table[1:]:
+                    row_dict = {}
+                    for h, val in zip(header, row):
+                        row_dict[h] = val
+                    rows.append(row_dict)
+
+            # 2. Fallback: text-line pattern matching (date + amount on same line)
+            if not tables:
+                text = page.extract_text() or ''
+                for line in text.split('\n'):
+                    m = re.search(
+                        r'(\d{1,2}[-/\s][A-Za-z0-9]{2,9}[-/\s]\d{2,4}).*?'
+                        r'([+-]?\u20b9?\s?[\d,]+\.\d{2})',
+                        line
+                    )
+                    if m:
+                        rows.append({
+                            'date': m.group(1),
+                            'transaction': line,
+                            'amount': m.group(2),
+                        })
+
+    if not rows:
+        raise ValueError('Could not find any transaction table in this PDF.')
+
+    df = pd.DataFrame(rows)
+    df = df.dropna(how='all')
+    return df
+
+
+# ── File loading ─────────────────────────────────────────────
+def load_file(uploaded_file):
+    """
+    Load CSV (GPay) / XLSX (Paytm/PhonePe) / PDF (any) and return (raw_df, app_name)
+    """
+    filename = uploaded_file.name
+    fname_lower = filename.lower()
+
+    if fname_lower.endswith('.pdf'):
+        df = _load_pdf(uploaded_file)
+        app_name = detect_app(filename, df)
+        if app_name == 'GPay':
+            app_name = 'PDF'
+        return df, app_name
+
+    elif fname_lower.endswith(('.xlsx', '.xls')):
+        xl = pd.ExcelFile(uploaded_file)
+        sheets = {s: pd.read_excel(xl, sheet_name=s) for s in xl.sheet_names}
+        app_name = detect_app(filename, sheets)
+
+        target_sheet = None
+        for s in sheets:
+            if 'passbook' in s.lower() or 'history' in s.lower() or 'transaction' in s.lower():
+                target_sheet = s
+                break
+        if target_sheet is None:
+            target_sheet = max(sheets, key=lambda s: len(sheets[s]))
+
+        df = sheets[target_sheet]
+        return df, app_name
+
+    else:
+        df = pd.read_csv(uploaded_file)
+        app_name = detect_app(filename, df)
+        return df, app_name
+
+
+# ── Helpers ────────────────────────────────────────────────────
+def _parse_signed_amount(val):
+    """Parse '+20,000.00' or '-100.00' or 'Dr 100.00' into signed float."""
+    s = str(val).strip()
+    if s == '' or s.lower() == 'nan' or s == '-':
+        return np.nan
+
+    sign = 1
+    s_lower = s.lower()
+    if 'dr' in s_lower:
+        sign = -1
+    elif 'cr' in s_lower:
+        sign = 1
+    elif s.startswith('+'):
+        sign = 1
+    elif s.startswith('-'):
+        sign = -1
+
+    s = re.sub(r'[+\-₹,a-zA-Z\s]', '', s)
+    try:
+        return sign * float(s)
+    except (ValueError, TypeError):
+        return np.nan
+
+
+def _clean_paytm_tag(tag):
+    if tag is None or str(tag) == 'nan':
+        return 'Others'
+    cleaned = ''.join(ch for ch in str(tag) if ch.isalnum() or ch.isspace())
+    cleaned = cleaned.replace('#', '').strip()
+    return cleaned if cleaned else 'Others'
+
+
+# ── App-specific cleaners ──────────────────────────────────────
+def _clean_gpay(df):
+    """GPay CSV: Date, Time, Transaction, Amount"""
+    rename_map = {}
+    for c in df.columns:
+        cl = c.strip().lower()
+        if cl == 'date':
+            rename_map[c] = 'date_raw'
+        elif cl == 'time':
+            rename_map[c] = 'time_raw'
+        elif cl == 'transaction':
+            rename_map[c] = 'merchant'
+        elif cl == 'amount':
+            rename_map[c] = 'amount'
+    df = df.rename(columns=rename_map)
+
+    df['date'] = pd.to_datetime(
+        df['date_raw'].astype(str) + ' ' + df.get('time_raw', '').astype(str),
+        errors='coerce', format='mixed'
+    )
+    mask = df['date'].isna()
+    if mask.any():
+        df.loc[mask, 'date'] = pd.to_datetime(df.loc[mask, 'date_raw'], errors='coerce')
+
+    df['amount'] = pd.to_numeric(df['amount'], errors='coerce')
+
+    df['txn_direction'] = df['merchant'].astype(str).apply(
+        lambda x: 'Credit' if x.lower().startswith('received') else 'Debit'
+    )
+    df['category'] = df['merchant'].apply(auto_categorize)
+    return df
+
+
+def _clean_paytm(df):
+    """Paytm XLSX 'Passbook Payment History' sheet"""
+    rename_map = {}
+    for c in df.columns:
+        cl = c.strip().lower()
+        if cl == 'date':
+            rename_map[c] = 'date_raw'
+        elif cl == 'time':
+            rename_map[c] = 'time_raw'
+        elif cl == 'transaction details':
+            rename_map[c] = 'merchant'
+        elif cl == 'amount':
+            rename_map[c] = 'amount_raw'
+        elif cl == 'tags':
+            rename_map[c] = 'tags_raw'
+    df = df.rename(columns=rename_map)
+
+    df['amount_signed'] = df['amount_raw'].apply(_parse_signed_amount)
+    df['txn_direction'] = df['amount_signed'].apply(
+        lambda x: 'Credit' if x > 0 else ('Debit' if x < 0 else 'Unknown')
+    )
+    df['amount'] = df['amount_signed'].abs()
+
+    date_parsed = pd.to_datetime(df['date_raw'], format='%d/%m/%Y', errors='coerce')
+    if date_parsed.isna().all():
+        date_parsed = pd.to_datetime(df['date_raw'], errors='coerce', dayfirst=True)
+
+    if 'time_raw' in df.columns:
+        df['date'] = pd.to_datetime(
+            date_parsed.dt.strftime('%Y-%m-%d') + ' ' + df['time_raw'].astype(str),
+            errors='coerce'
+        )
+        mask = df['date'].isna()
+        df.loc[mask, 'date'] = date_parsed[mask]
+    else:
+        df['date'] = date_parsed
+
+    if 'tags_raw' in df.columns:
+        df['category'] = df['tags_raw'].apply(_clean_paytm_tag)
+    else:
+        df['category'] = df['merchant'].apply(auto_categorize)
+
+    return df
+
+
+def _clean_phonepe(df):
+    """Generic PhonePe XLSX/CSV handler"""
+    rename_map = {}
+    for c in df.columns:
+        cl = c.strip().lower()
+        if 'date' in cl:
+            rename_map[c] = 'date_raw'
+        elif 'time' in cl:
+            rename_map[c] = 'time_raw'
+        elif 'amount' in cl:
+            rename_map[c] = 'amount_raw'
+        elif 'remark' in cl or 'transaction' in cl or 'detail' in cl:
+            rename_map[c] = 'merchant'
+        elif 'type' in cl:
+            rename_map[c] = 'txn_type_raw'
+    df = df.rename(columns=rename_map)
+
+    df['amount'] = df['amount_raw'].apply(_parse_signed_amount).abs()
+
+    date_parsed = pd.to_datetime(df['date_raw'], errors='coerce', dayfirst=True)
+    if 'time_raw' in df.columns:
+        df['date'] = pd.to_datetime(
+            date_parsed.dt.strftime('%Y-%m-%d') + ' ' + df['time_raw'].astype(str),
+            errors='coerce'
+        )
+        mask = df['date'].isna()
+        df.loc[mask, 'date'] = date_parsed[mask]
+    else:
+        df['date'] = date_parsed
+
+    if 'txn_type_raw' in df.columns:
+        df['txn_direction'] = df['txn_type_raw'].astype(str).apply(
+            lambda x: 'Credit' if 'credit' in x.lower() else 'Debit'
+        )
+    else:
+        df['txn_direction'] = 'Debit'
+
+    df['category'] = df['merchant'].apply(auto_categorize)
+    return df
+
+
+def _clean_pdf_generic(df):
+    """
+    Generic cleaner for PDF-extracted tables.
+    Tries to find date, amount, and description columns by name/content.
+    """
+    df = df.copy()
+    df.columns = [str(c).strip().lower() for c in df.columns]
+
+    # Find date column
+    date_col = None
+    for c in df.columns:
+        if 'date' in c:
+            date_col = c
+            break
+    if date_col is None:
+        date_col = df.columns[0]
+
+    # Find amount column
+    amount_col = None
+    for c in df.columns:
+        if 'amount' in c or 'amt' in c or 'debit' in c or 'credit' in c:
+            amount_col = c
+            break
+    if amount_col is None:
+        amount_col = df.columns[-1]
+
+    # Find description column
+    desc_col = None
+    for c in df.columns:
+        if any(k in c for k in ['transaction', 'description', 'particular', 'detail', 'remark', 'narration']):
+            desc_col = c
+            break
+    if desc_col is None:
+        candidates = [c for c in df.columns if c not in (date_col, amount_col)]
+        if candidates:
+            desc_col = max(candidates, key=lambda c: df[c].astype(str).str.len().mean())
+        else:
+            desc_col = date_col
+
+    out = pd.DataFrame()
+    out['date_raw']   = df[date_col]
+    out['merchant']   = df[desc_col].astype(str)
+    out['amount_raw'] = df[amount_col]
+
+    out['amount_signed'] = out['amount_raw'].apply(_parse_signed_amount)
+    out['amount'] = out['amount_signed'].abs()
+
+    def guess_direction(row):
+        text = str(row['merchant']).lower()
+        if row['amount_signed'] < 0 or 'paid' in text or 'debit' in text or 'sent' in text:
+            return 'Debit'
+        if row['amount_signed'] > 0 or 'received' in text or 'credit' in text:
+            return 'Credit'
+        return 'Debit'
+
+    out['txn_direction'] = out.apply(guess_direction, axis=1)
+
+    out['date'] = pd.to_datetime(out['date_raw'], errors='coerce', dayfirst=True)
+    if out['date'].isna().mean() > 0.5:
+        out['date'] = pd.to_datetime(out['date_raw'], errors='coerce', format='mixed', dayfirst=True)
+
+    out['category'] = out['merchant'].apply(auto_categorize)
+
+    return out
+
+
+# ── Main cleaning entry point ──────────────────────────────────
 def clean_data(df, app_name):
     df = df.copy()
-    df.columns = [c.strip().lower().replace(' ', '_') for c in df.columns]
+    df.columns = [str(c).strip() for c in df.columns]
 
-    # ── Rename columns based on app ──────────────────────────
-    if app_name == 'Paytm':
-        rename_map = {
-            'txn_date': 'date', 'txn_amount': 'amount',
-            'comment': 'merchant', 'txn_details': 'merchant',
-            'debit/credit': 'type', 'status': 'status',
-        }
+    if app_name == 'PDF':
+        df = _clean_pdf_generic(df)
+    elif app_name == 'Paytm':
+        df = _clean_paytm(df)
     elif app_name == 'PhonePe':
-        rename_map = {
-            'transaction_date': 'date', 'amount_(inr)': 'amount',
-            'remarks': 'merchant', 'transaction_id': 'transaction_id',
-            'status': 'status',
-        }
-    else:  # GPay / generic
-        rename_map = {
-            'transaction_date': 'date', 'txn_date': 'date',
-            'paid_amount': 'amount', 'debit': 'amount',
-        }
-    df.rename(columns=rename_map, inplace=True)
-
-    # ── Parse date ───────────────────────────────────────────
-    if 'date' in df.columns:
-        for fmt in ['%Y-%m-%d','%d-%m-%Y','%d/%m/%Y','%m/%d/%Y',
-                    '%d %b %Y','%b %d, %Y','%Y/%m/%d']:
-            try:
-                df['date'] = pd.to_datetime(df['date'], format=fmt)
-                break
-            except:
-                continue
-        if df['date'].dtype == object:
-            df['date'] = pd.to_datetime(df['date'], infer_datetime_format=True, errors='coerce')
-
-    # ── Parse amount ─────────────────────────────────────────
-    if 'amount' in df.columns:
-        df['amount'] = (
-            df['amount'].astype(str)
-            .str.replace('[₹,, ,+]', '', regex=True)
-            .str.replace('INR', '', regex=False)
-            .str.replace('Dr','', regex=False)
-            .str.replace('Cr','', regex=False)
-            .str.strip()
-        )
-        df['amount'] = pd.to_numeric(df['amount'], errors='coerce')
-        df = df.dropna(subset=['amount'])
-        df = df[df['amount'] > 0]
-
-    # ── Add missing columns ──────────────────────────────────
-    if 'status' not in df.columns:
-        df['status'] = 'Success'
+        df = _clean_phonepe(df)
     else:
-        df['status'] = df['status'].fillna('Success')
+        df = _clean_gpay(df)
 
-    if 'category' not in df.columns:
-        df['category'] = df.get('merchant', pd.Series(['Uncategorized'] * len(df)))
-        df['category'] = df['category'].apply(auto_categorize)
+    df['date'] = pd.to_datetime(df['date'], errors='coerce')
+    df = df.dropna(subset=['date', 'amount'])
+    df = df[df['amount'] > 0]
 
-    if 'merchant' not in df.columns:
-        df['merchant'] = 'Unknown'
-
-    if 'transaction_id' not in df.columns:
-        df['transaction_id'] = [f'TXN{str(i).zfill(6)}' for i in range(len(df))]
-
-    # ── Time features ────────────────────────────────────────
-    df['date']        = pd.to_datetime(df['date'])
     df['hour']        = df['date'].dt.hour
     df['day_of_week'] = df['date'].dt.strftime('%A')
     df['month']       = df['date'].dt.strftime('%B')
     df['month_num']   = df['date'].dt.month
 
-    # ── Anomaly detection (IQR) ──────────────────────────────
-    Q1  = df['amount'].quantile(0.25)
-    Q3  = df['amount'].quantile(0.75)
+    if 'category' not in df.columns or df['category'].isna().all():
+        df['category'] = df['merchant'].apply(auto_categorize)
+
+    if 'status' not in df.columns:
+        df['status'] = 'Success'
+    df['status'] = df['status'].fillna('Success')
+
+    if 'transaction_id' not in df.columns:
+        df['transaction_id'] = [f'TXN{str(i).zfill(6)}' for i in range(len(df))]
+
+    Q1 = df['amount'].quantile(0.25)
+    Q3 = df['amount'].quantile(0.75)
     IQR = Q3 - Q1
     df['is_anomaly'] = df['amount'] > (Q3 + 3 * IQR)
 
-    return df
+    keep_cols = ['transaction_id','date','hour','day_of_week','month','month_num',
+                  'amount','merchant','category','status','is_anomaly']
+    if 'txn_direction' in df.columns:
+        keep_cols.append('txn_direction')
 
-def auto_categorize(merchant):
-    merchant = str(merchant).lower()
-    if any(k in merchant for k in ['zomato','swiggy','food','restaurant','cafe','pizza','burger','kfc','domino']):
-        return 'Food & Dining'
-    elif any(k in merchant for k in ['amazon','flipkart','myntra','shop','store','mall','meesho','ajio']):
-        return 'Shopping'
-    elif any(k in merchant for k in ['electricity','gas','water','bill','broadband','dth','recharge','airtel','jio','bsnl','vi']):
-        return 'Utilities & Recharge'
-    elif any(k in merchant for k in ['ola','uber','rapido','metro','irctc','bus','train','flight','travel']):
-        return 'Transport'
-    elif any(k in merchant for k in ['netflix','hotstar','spotify','bookmyshow','prime','zee','movie']):
-        return 'Entertainment'
-    elif any(k in merchant for k in ['bigbasket','blinkit','grocer','supermarket','dmart','zepto','instamart']):
-        return 'Groceries'
-    elif any(k in merchant for k in ['apollo','pharmacy','hospital','doctor','medical','health','netmeds','1mg']):
-        return 'Healthcare'
-    elif any(k in merchant for k in ['udemy','coursera','byju','school','college','education','unacademy']):
-        return 'Education'
-    elif any(k in merchant for k in ['transfer','sent','received','upi','neft','imps','emi','loan']):
-        return 'Bank Transfer'
-    return 'Others'
+    return df[keep_cols].reset_index(drop=True)
 
+
+# ── Aggregation helpers ─────────────────────────────────────────
 def get_kpis(df):
-    success_df = df[df['status'].str.lower().str.contains('success', na=False)]
+    success_df = df[df['status'].astype(str).str.lower().str.contains('success', na=False)]
+    has_dir = 'txn_direction' in df.columns
+    debit_df = df[df['txn_direction'] == 'Debit'] if has_dir else df
+
     return {
         'total_transactions': len(df),
-        'total_spend':        round(success_df['amount'].sum(), 2),
-        'avg_transaction':    round(df['amount'].mean(), 2),
-        'max_transaction':    round(df['amount'].max(), 2),
+        'total_spend':        round(debit_df['amount'].sum(), 2),
+        'total_received':     round(df[df['txn_direction'] == 'Credit']['amount'].sum(), 2) if has_dir else 0,
+        'avg_transaction':    round(df['amount'].mean(), 2) if len(df) else 0,
+        'max_transaction':    round(df['amount'].max(), 2) if len(df) else 0,
         'anomaly_count':      int(df['is_anomaly'].sum()),
-        'success_rate':       round(df['status'].str.lower().str.contains('success', na=False).mean() * 100, 1),
-        'failed_count':       int(df['status'].str.lower().str.contains('fail', na=False).sum()),
+        'success_rate':       round(success_df.shape[0] / len(df) * 100, 1) if len(df) else 0,
+        'failed_count':       int(df['status'].astype(str).str.lower().str.contains('fail', na=False).sum()),
     }
+
 
 def get_heatmap_data(df):
     order = ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday']
     df = df.copy()
     df['day_of_week'] = pd.Categorical(df['day_of_week'], categories=order, ordered=True)
     return (
-        df.groupby(['day_of_week','hour'])['amount']
+        df.groupby(['day_of_week','hour'], observed=False)['amount']
         .sum().reset_index()
         .pivot(index='day_of_week', columns='hour', values='amount')
         .fillna(0)
     )
+
 
 def get_category_data(df):
     return (
@@ -143,6 +431,7 @@ def get_category_data(df):
         .agg(total_amount=('amount','sum'), count=('amount','count'))
         .reset_index().sort_values('total_amount', ascending=False)
     )
+
 
 def get_merchant_data(df, top_n=10):
     return (
@@ -152,17 +441,23 @@ def get_merchant_data(df, top_n=10):
         .head(top_n)
     )
 
+
 def get_monthly_trend(df):
     return (
         df.groupby(['month_num','month'])['amount']
         .sum().reset_index().sort_values('month_num')
     )
 
+
 def get_daily_trend(df):
-    return df.groupby('date')['amount'].sum().reset_index()
+    out = df.groupby(df['date'].dt.date)['amount'].sum().reset_index()
+    out.columns = ['date', 'amount']
+    return out
+
 
 def get_status_data(df):
     return df['status'].value_counts().reset_index()
+
 
 def get_anomalies(df):
     cols = ['transaction_id','date','merchant','category','amount','status']
