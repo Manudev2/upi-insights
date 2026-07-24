@@ -87,6 +87,17 @@ def _load_pdf(uploaded_file):
     """Parser for Paytm Passbook PDF (card/column layout, not a real table)."""
     import pdfplumber, pandas as pd, re
 
+    # Defensive: Streamlit's UploadedFile (and any file-like object) keeps
+    # a read cursor. If something upstream (a preview, a hash, another
+    # loader) already read from this object, the cursor sits at EOF and
+    # pdfplumber will see an empty/corrupt stream -> silently 0 pages of
+    # words -> "No transactions found" even though the code is correct.
+    # Rewind defensively before opening.
+    try:
+        uploaded_file.seek(0)
+    except Exception:
+        pass
+
     raw_rows = []
     with pdfplumber.open(uploaded_file) as pdf:
         # Determine the statement's ending year from the cover page, e.g.
