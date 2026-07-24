@@ -55,71 +55,125 @@ def detect_app(filename, df_or_sheets):
 # ── PDF extraction ───────────────────────────────────────────
 def _load_pdf(uploaded_file):
     """
-    PhonePe / UPI PDF parser
+    Generic UPI PDF parser.
+    Works with Paytm, PhonePe, GPay and most bank UPI statements.
     """
-    transactions = []
+
+    import pdfplumber
+    import pandas as pd
+    import re
+
+    rows = []
 
     with pdfplumber.open(uploaded_file) as pdf:
-        text = ""
 
         for page in pdf.pages:
-            page_text = page.extract_text()
-            if page_text:
-                text += page_text + "\n"
 
-    lines = text.split("\n")
+            tables = page.extract_tables()
 
-    i = 0
-    while i < len(lines):
+            # ---------- First preference : extract table ----------
+            if tables:
+                for table in tables:
 
-        line = lines[i].strip()
+                    if not table or len(table) < 2:
+                        continue
 
-        if re.match(r"^[A-Z][a-z]{2}\s\d{2},\s\d{4}$", line):
+                    header = [str(x).strip().lower() if x else "" for x in table[0]]
 
-            date = line
-            details = ""
-            txn_type = ""
-            amount = ""
+                    date_idx = None
+                    amount_idx = None
+                    desc_idx = None
 
-            j = i + 1
+                    for i, h in enumerate(header):
+                        if "date" in h:
+                            date_idx = i
 
-            while j < len(lines):
+                        if (
+                            "amount" in h
+                            or "debit" in h
+                            or "credit" in h
+                            or "inr" in h
+                        ):
+                            amount_idx = i
 
-                curr = lines[j].strip()
+                        if any(
+                            k in h
+                            for k in [
+                                "description",
+                                "details",
+                                "transaction",
+                                "remarks",
+                                "particular",
+                                "merchant",
+                            ]
+                        ):
+                            desc_idx = i
 
-                if curr.startswith("Credit INR"):
-                    txn_type = "Credit"
-                    amount = curr.replace("Credit INR", "").strip()
-                    break
+                    if date_idx is None:
+                        continue
 
-                elif curr.startswith("Debit INR"):
-                    txn_type = "Debit"
-                    amount = curr.replace("Debit INR", "").strip()
-                    break
+                    if desc_idx is None:
+                        desc_idx = min(date_idx + 1, len(header) - 1)
 
-                else:
-                    details += " " + curr
+                    if amount_idx is None:
+                        amount_idx = len(header) - 1
 
-                j += 1
+                    for r in table[1:]:
 
-            if amount:
-                transactions.append({
-                    "date": date,
-                    "transaction": details.strip(),
-                    "type": txn_type,
-                    "amount": amount
-                })
+                        if len(r) <= max(date_idx, desc_idx, amount_idx):
+                            continue
 
-            i = j
+                        rows.append(
+                            {
+                                "date_raw": r[date_idx],
+                                "merchant": str(r[desc_idx]),
+                                "amount_raw": r[amount_idx],
+                            }
+                        )
 
-        i += 1
+            # ---------- Fallback : text parser ----------
+            else:
 
-    if not transactions:
-        raise ValueError(
-            "No transactions found. Please upload a valid PhonePe statement."
-        )
+                text = page.extract_text()
 
-    return pd.DataFrame(transactions)
+                if not text:
+                    continue
+
+                lines = text.split("\n")
+
+                current_date = None
+
+                for line in lines:
+
+                    line = line.strip()
+
+                    m = re.search(
+                        r"(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})",
+                        line,
+                    )
+
+                    if m:
+                        current_date = m.group(1)
+
+                    amt = re.search(
+                        r"(?:₹|Rs\.?|INR)?\s?([0-9,]+\.\d{2}|[0-9,]+)",
+                        line,
+                    )
+
+                    if current_date and amt:
+
+                        rows.append(
+                            {
+                                "date_raw": current_date,
+                                "merchant": line,
+                                "amount_raw": amt.group(1),
+                            }
+                        )
+
+    if len(rows) == 0:
+        raise ValueError("No transactions found in this PDF.")
+
+    return pd.DataFrame(rows)
 
 
 # ── File loading ─────────────────────────────────────────────
@@ -132,9 +186,7 @@ def load_file(uploaded_file):
 
     if fname_lower.endswith('.pdf'):
         df = _load_pdf(uploaded_file)
-        app_name = detect_app(filename, df)
-        if app_name == 'GPay':
-            app_name = 'PDF'
+        app_name = "PDF"
         return df, app_name
 
     elif fname_lower.endswith(('.xlsx', '.xls')):
