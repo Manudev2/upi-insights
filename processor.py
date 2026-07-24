@@ -53,128 +53,46 @@ def detect_app(filename, df_or_sheets):
 
 
 # ── PDF extraction ───────────────────────────────────────────
+
 def _load_pdf(uploaded_file):
-    """
-    Generic UPI PDF parser.
-    Works with Paytm, PhonePe, GPay and most bank UPI statements.
-    """
-
-    import pdfplumber
-    import pandas as pd
-    import re
-
-    rows = []
-
+    """Parser for Paytm Passbook PDF."""
+    import pdfplumber,pandas as pd,re
+    rows=[]
+    current_year=None
     with pdfplumber.open(uploaded_file) as pdf:
-
         for page in pdf.pages:
-
-            tables = page.extract_tables()
-
-            # ---------- First preference : extract table ----------
-            if tables:
-                for table in tables:
-
-                    if not table or len(table) < 2:
-                        continue
-
-                    header = [str(x).strip().lower() if x else "" for x in table[0]]
-
-                    date_idx = None
-                    amount_idx = None
-                    desc_idx = None
-
-                    for i, h in enumerate(header):
-                        if "date" in h:
-                            date_idx = i
-
-                        if (
-                            "amount" in h
-                            or "debit" in h
-                            or "credit" in h
-                            or "inr" in h
-                        ):
-                            amount_idx = i
-
-                        if any(
-                            k in h
-                            for k in [
-                                "description",
-                                "details",
-                                "transaction",
-                                "remarks",
-                                "particular",
-                                "merchant",
-                            ]
-                        ):
-                            desc_idx = i
-
-                    if date_idx is None:
-                        continue
-
-                    if desc_idx is None:
-                        desc_idx = min(date_idx + 1, len(header) - 1)
-
-                    if amount_idx is None:
-                        amount_idx = len(header) - 1
-
-                    for r in table[1:]:
-
-                        if len(r) <= max(date_idx, desc_idx, amount_idx):
-                            continue
-
-                        rows.append(
-                            {
-                                "date_raw": r[date_idx],
-                                "merchant": str(r[desc_idx]),
-                                "amount_raw": r[amount_idx],
-                            }
-                        )
-
-            # ---------- Fallback : text parser ----------
-            else:
-
-                text = page.extract_text()
-
-                if not text:
-                    continue
-
-                lines = text.split("\n")
-
-                current_date = None
-
-                for line in lines:
-
-                    line = line.strip()
-
-                    m = re.search(
-                        r"(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})",
-                        line,
-                    )
-
-                    if m:
-                        current_date = m.group(1)
-
-                    amt = re.search(
-                        r"(?:₹|Rs\.?|INR)?\s?([0-9,]+\.\d{2}|[0-9,]+)",
-                        line,
-                    )
-
-                    if current_date and amt:
-
-                        rows.append(
-                            {
-                                "date_raw": current_date,
-                                "merchant": line,
-                                "amount_raw": amt.group(1),
-                            }
-                        )
-
-    if len(rows) == 0:
+            txt=page.extract_text() or ""
+            if current_year is None:
+                m=re.search(r"Statement for\s+\d{1,2}\s\w+'(\d{2})\s+-",txt)
+                if m:
+                    current_year=2000+int(m.group(1))
+                else:
+                    current_year=2025
+            lines=[l.strip() for l in txt.split("\n") if l.strip()]
+            i=0
+            while i < len(lines):
+                if re.match(r'^\d{1,2}\s[A-Za-z]{3}$',lines[i]):
+                    date=lines[i]
+                    tm=lines[i+1] if i+1<len(lines) else ""
+                    j=i+2
+                    merchant=""
+                    while j<len(lines):
+                        if re.search(r'^[+-]?\s*Rs\.?',lines[j]):
+                            amt=lines[j]
+                            rows.append({
+                                "date_raw":f"{date} {current_year} {tm}",
+                                "merchant":merchant.strip() or "Unknown",
+                                "amount_raw":amt
+                            })
+                            break
+                        if not lines[j].startswith(("UPI ID","UPI Ref","Tag:","Note:","#","Union Bank","Punjab","Other UPI","on","For any","Contact","Passbook","All payments","Date &","Time","Transaction","Details","Notes","Your Account","Amount","Page")):
+                            merchant += " "+lines[j]
+                        j+=1
+                    i=j
+                i+=1
+    if not rows:
         raise ValueError("No transactions found in this PDF.")
-
     return pd.DataFrame(rows)
-
 
 # ── File loading ─────────────────────────────────────────────
 def load_file(uploaded_file):
