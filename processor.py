@@ -54,44 +54,125 @@ def detect_app(filename, df_or_sheets):
 
 # ── PDF extraction ───────────────────────────────────────────
 
+_MONTHS = {m: i + 1 for i, m in enumerate(
+    ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+)}
+
+# Column boundaries (x0 coordinates) for the Paytm passbook card layout.
+# Each transaction "row" in the PDF is actually a block of several text
+# lines laid out in 5 side-by-side columns (Date&Time, Transaction
+# Details, Notes&Tags, Your Account, Amount). pdfplumber's plain
+# extract_text() merges words that share a similar vertical position
+# onto the same line REGARDLESS of which column they belong to, which
+# scrambles date/merchant/amount together. We instead pull word-level
+# bounding boxes and bucket each word into its column by x0, then
+# reconstruct each column's text independently.
+_COL_BOUNDS = [
+    ('dt', 85),
+    ('det', 285),
+    ('notes', 390),
+    ('acct', 490),
+    ('amt', float('inf')),
+]
+
+
+def _bucket_column(x0):
+    for name, upper in _COL_BOUNDS:
+        if x0 < upper:
+            return name
+    return 'amt'
+
+
 def _load_pdf(uploaded_file):
-    """Parser for Paytm Passbook PDF."""
-    import pdfplumber,pandas as pd,re
-    rows=[]
-    current_year=None
+    """Parser for Paytm Passbook PDF (card/column layout, not a real table)."""
+    import pdfplumber, pandas as pd, re
+
+    raw_rows = []
     with pdfplumber.open(uploaded_file) as pdf:
+        # Determine the statement's ending year from the cover page, e.g.
+        # "Statement for 24 JUL'25 - 23 JUL'26" -> end_year = 2026
+        header_txt = pdf.pages[0].extract_text() or ""
+        m = re.search(r"Statement for\s+\d{1,2}\s\w+'\d{2}\s+-\s+\d{1,2}\s\w+'(\d{2})", header_txt)
+        end_year = 2000 + int(m.group(1)) if m else 2025
+
         for page in pdf.pages:
-            txt=page.extract_text() or ""
-            if current_year is None:
-                m=re.search(r"Statement for\s+\d{1,2}\s\w+'(\d{2})\s+-",txt)
-                if m:
-                    current_year=2000+int(m.group(1))
-                else:
-                    current_year=2025
-            lines=[l.strip() for l in txt.split("\n") if l.strip()]
-            i=0
-            while i < len(lines):
-                if re.match(r'^\d{1,2}\s[A-Za-z]{3}$',lines[i]):
-                    date=lines[i]
-                    tm=lines[i+1] if i+1<len(lines) else ""
-                    j=i+2
-                    merchant=""
-                    while j<len(lines):
-                        if re.search(r'^[+-]?\s*Rs\.?',lines[j]):
-                            amt=lines[j]
-                            rows.append({
-                                "date_raw":f"{date} {current_year} {tm}",
-                                "merchant":merchant.strip() or "Unknown",
-                                "amount_raw":amt
-                            })
-                            break
-                        if not lines[j].startswith(("UPI ID","UPI Ref","Tag:","Note:","#","Union Bank","Punjab","Other UPI","on","For any","Contact","Passbook","All payments","Date &","Time","Transaction","Details","Notes","Your Account","Amount","Page")):
-                            merchant += " "+lines[j]
-                        j+=1
-                    i=j
-                i+=1
-    if not rows:
+            words = page.extract_words()
+            if not words:
+                continue
+
+            # A new transaction block starts wherever a bare day-number
+            # (e.g. "21") appears in the leftmost (date) column.
+            anchors = sorted(set(
+                w['top'] for w in words if w['x0'] < 85 and re.match(r'^\d{1,2}$', w['text'])
+            ))
+            for idx, atop in enumerate(anchors):
+                bottom = anchors[idx + 1] if idx + 1 < len(anchors) else float('inf')
+                block_words = [w for w in words if atop - 1 <= w['top'] < bottom - 1]
+
+                cols = {'dt': [], 'det': [], 'notes': [], 'acct': [], 'amt': []}
+                for w in block_words:
+                    cols[_bucket_column(w['x0'])].append(w)
+
+                def join_col(ws):
+                    ws = sorted(ws, key=lambda w: (round(w['top']), w['x0']))
+                    return ' '.join(w['text'] for w in ws)
+
+                raw_rows.append({k: join_col(v) for k, v in cols.items()})
+
+    # Keep only blocks that actually look like a transaction row: date
+    # column must read "DD Mon ... HH:MM AM/PM" and amount column must
+    # contain "Rs." (this filters out header/footer/summary blocks).
+    parsed = []
+    for r in raw_rows:
+        m = re.match(r'^(\d{1,2})\s([A-Za-z]{3}).*?(\d{1,2}:\d{2}\s?[AP]M)', r['dt'])
+        if not m or 'Rs.' not in r['amt']:
+            continue
+        day, mon, time_ = m.group(1), m.group(2), m.group(3)
+
+        # Merchant/description text lives in the "det" column, but also
+        # contains "UPI ID: ..." / "UPI Ref No: ..." / trailing "on"
+        # lines mixed in - strip those out.
+        det_text = r['det']
+        det_text = re.sub(r'\s*UPI ID:.*?(?=UPI Ref No:|$)', ' ', det_text)
+        det_text = re.sub(r'\s*UPI Ref No:.*$', '', det_text)
+        det_text = re.sub(r'\bon\b\s*$', '', det_text).strip()
+        det_text = re.sub(r'\s+', ' ', det_text)
+
+        tags_text = re.sub(r'^Tag:\s*', '', r['notes']).strip()
+
+        parsed.append({
+            'day': day, 'mon': mon, 'time': time_,
+            'merchant': det_text or 'Unknown',
+            'amount_raw': r['amt'].strip(),
+            'tags_raw': tags_text,
+            'account': r['acct'].strip(),
+        })
+
+    if not parsed:
         raise ValueError("No transactions found in this PDF.")
+
+    # Assign calendar years. Rows come in reverse-chronological order
+    # (newest first). Statement covers two calendar years, so whenever
+    # the month number goes UP compared to the previous row (e.g. Jan
+    # -> Dec), that means we've stepped back into the prior year.
+    year = end_year
+    prev_month = None
+    rows = []
+    for p in parsed:
+        mnum = _MONTHS.get(p['mon'][:3].title())
+        if prev_month is not None and mnum is not None and mnum > prev_month:
+            year -= 1
+        prev_month = mnum if mnum is not None else prev_month
+
+        rows.append({
+            'date_raw': f"{p['day']} {p['mon']} {year}",
+            'time_raw': p['time'],
+            'merchant': p['merchant'],
+            'amount_raw': p['amount_raw'],
+            'tags_raw': p['tags_raw'],
+            'account': p['account'],
+        })
+
     return pd.DataFrame(rows)
 
 # ── File loading ─────────────────────────────────────────────
@@ -104,7 +185,10 @@ def load_file(uploaded_file):
 
     if fname_lower.endswith('.pdf'):
         df = _load_pdf(uploaded_file)
-        app_name = "PDF"
+        # _load_pdf already emits Paytm-style columns (date_raw, time_raw,
+        # merchant, amount_raw, tags_raw), so route it through the Paytm
+        # cleaner rather than the generic PDF-table cleaner.
+        app_name = "Paytm"
         return df, app_name
 
     elif fname_lower.endswith(('.xlsx', '.xls')):
@@ -147,9 +231,16 @@ def _parse_signed_amount(val):
     elif s.startswith('-'):
         sign = -1
 
-    s = re.sub(r'[+\-₹,a-zA-Z\s]', '', s)
+    # Extract just the numeric portion (e.g. "Rs.2,500" -> "2,500",
+    # not ".2500"). Stripping characters blindly left a stray decimal
+    # point from "Rs." attached to the number, silently corrupting
+    # every amount by ~100x (e.g. Rs.2,500 became 0.25).
+    m = re.search(r'\d[\d,]*\.?\d*', s)
+    if not m:
+        return np.nan
+    num_str = m.group(0).replace(',', '')
     try:
-        return sign * float(s)
+        return sign * float(num_str)
     except (ValueError, TypeError):
         return np.nan
 
@@ -216,6 +307,15 @@ def _clean_paytm(df):
     df['txn_direction'] = df['amount_signed'].apply(
         lambda x: 'Credit' if x > 0 else ('Debit' if x < 0 else 'Unknown')
     )
+
+    # Self-transfer rows (money moved between the user's own accounts)
+    # have no +/- sign in the PDF and the statement explicitly excludes
+    # them from total money paid/received. Tag them separately so
+    # get_kpis()'s Debit/Credit sums don't double-count them.
+    if 'tags_raw' in df.columns:
+        is_self = df['tags_raw'].astype(str).str.contains('Self Transfer', case=False, na=False)
+        df.loc[is_self, 'txn_direction'] = 'Self Transfer'
+
     df['amount'] = df['amount_signed'].abs()
 
     date_parsed = pd.to_datetime(df['date_raw'], format='%d/%m/%Y', errors='coerce')
