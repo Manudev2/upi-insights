@@ -4,6 +4,8 @@ import pdfplumber
 import re
 import csv
 
+print("=== PROCESSOR VERSION: v4-csv-messy-fix ===")
+
 
 # ── Categorization ───────────────────────────────────────────
 _CATEGORY_KEYWORDS = {
