@@ -5,26 +5,29 @@ import re
 
 
 # ── Categorization ───────────────────────────────────────────
+_CATEGORY_KEYWORDS = {
+    'Food & Dining':  ['zomato','swiggy','food','restaurant','cafe','pizza','burger','kfc','domino'],
+    'Shopping':       ['amazon','flipkart','myntra','shop','store','mall','meesho','ajio','shopping'],
+    'Utilities & Recharge': ['electricity','gas','water','bill','broadband','dth','recharge','airtel','jio','bsnl','vi'],
+    'Transport':      ['ola','uber','rapido','metro','irctc','bus','train','flight','travel','petrol'],
+    'Entertainment':  ['netflix','hotstar','spotify','bookmyshow','prime','zee','movie','youtube'],
+    'Groceries':      ['bigbasket','blinkit','grocer','supermarket','dmart','zepto','instamart','vegetable'],
+    'Healthcare':     ['apollo','pharmacy','hospital','doctor','medical','health','netmeds','1mg'],
+    'Education':      ['udemy','coursera','byju','school','college','education','unacademy'],
+    'Bank Transfer':  ['transfer','sent','received','self','neft','imps','emi','loan','atm'],
+}
+
+
 def auto_categorize(text):
     text = str(text).lower()
-    if any(k in text for k in ['zomato','swiggy','food','restaurant','cafe','pizza','burger','kfc','domino']):
-        return 'Food & Dining'
-    elif any(k in text for k in ['amazon','flipkart','myntra','shop','store','mall','meesho','ajio','shopping']):
-        return 'Shopping'
-    elif any(k in text for k in ['electricity','gas','water','bill','broadband','dth','recharge','airtel','jio','bsnl','vi']):
-        return 'Utilities & Recharge'
-    elif any(k in text for k in ['ola','uber','rapido','metro','irctc','bus','train','flight','travel','petrol']):
-        return 'Transport'
-    elif any(k in text for k in ['netflix','hotstar','spotify','bookmyshow','prime','zee','movie']):
-        return 'Entertainment'
-    elif any(k in text for k in ['bigbasket','blinkit','grocer','supermarket','dmart','zepto','instamart','vegetable']):
-        return 'Groceries'
-    elif any(k in text for k in ['apollo','pharmacy','hospital','doctor','medical','health','netmeds','1mg']):
-        return 'Healthcare'
-    elif any(k in text for k in ['udemy','coursera','byju','school','college','education','unacademy']):
-        return 'Education'
-    elif any(k in text for k in ['transfer','sent','received','self','neft','imps','emi','loan','atm']):
-        return 'Bank Transfer'
+    # Whole-word matching, not plain substring: plain "in" checks let
+    # e.g. "emi" match inside "premium", or "vi" (Vi telecom) match
+    # inside almost any word containing those two letters ("video",
+    # "service", "invoice"...), silently mis-categorizing transactions.
+    for category, keywords in _CATEGORY_KEYWORDS.items():
+        for kw in keywords:
+            if re.search(r'\b' + re.escape(kw) + r'\b', text):
+                return category
     return 'Others'
 
 
@@ -47,6 +50,8 @@ def detect_app(filename, df_or_sheets):
 
     if 'tags' in cols or 'upi ref no.' in cols:
         return 'Paytm'
+    if 'transaction id' in cols and 'payment method' in cols and 'description' in cols:
+        return 'Google Play'
     if 'transaction' in cols and 'amount' in cols:
         return 'GPay'
     return 'GPay'
@@ -452,6 +457,61 @@ def _clean_phonepe(df):
     return df
 
 
+def _clean_google_play(df):
+    """Google Play purchase history CSV:
+    Time, Transaction ID, Description, Product, Payment method, Status, Amount
+    e.g. Time="Jan 12, 2026, 4:31 AM", Amount="INR 299.00"
+    """
+    df = df.copy()
+    rename_map = {}
+    for c in df.columns:
+        cl = str(c).strip().lower()
+        if cl == 'time':
+            rename_map[c] = 'date_raw'
+        elif cl == 'description':
+            rename_map[c] = 'merchant'
+        elif cl == 'amount':
+            rename_map[c] = 'amount_raw'
+        elif cl == 'status':
+            rename_map[c] = 'status_raw'
+        elif cl == 'product':
+            rename_map[c] = 'product'
+    df = df.rename(columns=rename_map)
+
+    # "Jan 12, 2026, 4:31 AM" -> parse directly, no separate time column
+    df['date'] = pd.to_datetime(df['date_raw'], errors='coerce')
+
+    df['amount_signed'] = df['amount_raw'].apply(_parse_signed_amount)
+    df['amount'] = df['amount_signed'].abs()
+
+    # Google Play purchases are always money going out (Debit); there is
+    # no credit side to this export.
+    df['txn_direction'] = 'Debit'
+
+    # Normalize Complete/Cancelled/Failed into the Success/Failed
+    # vocabulary get_kpis() looks for (it matches on 'success'/'fail'
+    # substrings), otherwise every row here would silently show up as
+    # 0% success rate and 0 failed count.
+    if 'status_raw' in df.columns:
+        def norm_status(s):
+            s = str(s).strip().lower()
+            if s in ('complete', 'completed', 'success'):
+                return 'Success'
+            if s in ('cancelled', 'canceled', 'failed', 'declined'):
+                return 'Failed'
+            return str(s).title()
+        df['status'] = df['status_raw'].apply(norm_status)
+    else:
+        df['status'] = 'Success'
+
+    desc_source = df['merchant'] if 'merchant' in df.columns else df.get('product', 'Unknown')
+    df['category'] = desc_source.apply(auto_categorize)
+    if 'merchant' not in df.columns:
+        df['merchant'] = df.get('product', 'Unknown')
+
+    return df
+
+
 def _clean_pdf_generic(df):
     """
     Generic cleaner for PDF-extracted tables.
@@ -541,6 +601,8 @@ def clean_data(df, app_name):
         df = _clean_paytm(df)
     elif app_name == 'PhonePe':
         df = _clean_phonepe(df)
+    elif app_name == 'Google Play':
+        df = _clean_google_play(df)
     else:
         df = _clean_gpay(df)
 
