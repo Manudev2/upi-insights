@@ -2,6 +2,7 @@ import pandas as pd
 import numpy as np
 import pdfplumber
 import re
+import csv
 
 
 # ── Categorization ───────────────────────────────────────────
@@ -191,6 +192,58 @@ def _load_pdf(uploaded_file):
 
     return pd.DataFrame(rows)
 
+# ── Robust CSV loading (handles preamble/footer junk) ─────────
+
+def _load_messy_csv(uploaded_file):
+    """
+    Some CSV exports (e.g. PhonePe's statement CSV) aren't clean tables:
+    they have metadata lines before the header ("Transaction Statement
+    for +91...", "Duration,...", a blank line) and disclaimer/footer
+    text after the data. Plain pd.read_csv throws a ParserError on
+    these ("Expected 2 fields, saw 8") because it assumes row 1 is the
+    header. This scans for the real header row and the real data
+    rows by field-count, skipping anything else.
+    """
+    try:
+        uploaded_file.seek(0)
+    except Exception:
+        pass
+    raw = uploaded_file.read()
+    if isinstance(raw, bytes):
+        raw = raw.decode('utf-8', errors='replace')
+    raw_lines = raw.splitlines(keepends=True)
+
+    header_idx = None
+    for i, line in enumerate(raw_lines[:15]):
+        if not line.strip():
+            continue
+        parts = next(csv.reader([line]))
+        if len(parts) >= 4:
+            header_idx = i
+            break
+    if header_idx is None:
+        raise ValueError("Could not find a table header in this CSV.")
+
+    header = next(csv.reader([raw_lines[header_idx]]))
+    ncols = len(header)
+
+    data_rows = []
+    for line in raw_lines[header_idx + 1:]:
+        if not line.strip():
+            continue
+        parts = next(csv.reader([line]))
+        if len(parts) != ncols:
+            # First row that doesn't match the header's field count
+            # after data has started = footer/disclaimer text; stop.
+            break
+        data_rows.append(parts)
+
+    if not data_rows:
+        raise ValueError("No transaction rows found in this CSV.")
+
+    return pd.DataFrame(data_rows, columns=header)
+
+
 # ── File loading ─────────────────────────────────────────────
 def load_file(uploaded_file):
     """
@@ -224,7 +277,18 @@ def load_file(uploaded_file):
         return df, app_name
 
     else:
-        df = pd.read_csv(uploaded_file)
+        try:
+            uploaded_file.seek(0)
+        except Exception:
+            pass
+        try:
+            df = pd.read_csv(uploaded_file)
+        except Exception:
+            # Plain pd.read_csv fails on exports that have metadata
+            # preamble lines and/or disclaimer footer text (e.g.
+            # PhonePe's statement CSV). Fall back to a loader that
+            # locates the real header/data rows by field count.
+            df = _load_messy_csv(uploaded_file)
         app_name = detect_app(filename, df)
         return df, app_name
 
@@ -388,7 +452,7 @@ def _clean_phonepe(df):
         ]:
             rename_map[c] = 'merchant'
 
-        elif cl == 'type':
+        elif cl in ['type', 'transaction type']:
             rename_map[c] = 'txn_type_raw'
 
     df = df.rename(columns=rename_map)
@@ -409,17 +473,31 @@ def _clean_phonepe(df):
     if 'merchant' not in df.columns:
         df['merchant'] = 'Unknown'
 
+    df['date_raw'] = df['date_raw'].astype(str).str.strip()
+    if 'time_raw' in df.columns:
+        df['time_raw'] = df['time_raw'].astype(str).str.strip()
+
     df['amount'] = (
         df['amount_raw']
         .apply(_parse_signed_amount)
         .abs()
     )
 
+    # Try the unambiguous ISO format first. dayfirst=True actively
+    # misparses ISO 'YYYY-MM-DD' strings (it swaps month/day), turning
+    # e.g. "2022-10-13" into NaT once the swapped "day" (13) can't be a
+    # valid month - silently dropping hundreds of otherwise-good rows.
     date_parsed = pd.to_datetime(
         df['date_raw'],
-        errors='coerce',
-        dayfirst=True
+        format='%Y-%m-%d',
+        errors='coerce'
     )
+    if date_parsed.isna().mean() > 0.5:
+        date_parsed = pd.to_datetime(
+            df['date_raw'],
+            errors='coerce',
+            dayfirst=True
+        )
 
     if 'time_raw' in df.columns:
 
