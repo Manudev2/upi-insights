@@ -23,6 +23,10 @@ _CATEGORY_KEYWORDS = {
 
 def auto_categorize(text):
     text = str(text).lower()
+    # Whole-word matching, not plain substring: plain "in" checks let
+    # e.g. "emi" match inside "premium", or "vi" (Vi telecom) match
+    # inside almost any word containing those two letters ("video",
+    # "service", "invoice"...), silently mis-categorizing transactions.
     for category, keywords in _CATEGORY_KEYWORDS.items():
         for kw in keywords:
             if re.search(r'\b' + re.escape(kw) + r'\b', text):
@@ -62,6 +66,15 @@ _MONTHS = {m: i + 1 for i, m in enumerate(
     ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
 )}
 
+# Column boundaries (x0 coordinates) for the Paytm passbook card layout.
+# Each transaction "row" in the PDF is actually a block of several text
+# lines laid out in 5 side-by-side columns (Date&Time, Transaction
+# Details, Notes&Tags, Your Account, Amount). pdfplumber's plain
+# extract_text() merges words that share a similar vertical position
+# onto the same line REGARDLESS of which column they belong to, which
+# scrambles date/merchant/amount together. We instead pull word-level
+# bounding boxes and bucket each word into its column by x0, then
+# reconstruct each column's text independently.
 _COL_BOUNDS = [
     ('dt', 85),
     ('det', 285),
@@ -79,8 +92,15 @@ def _bucket_column(x0):
 
 
 def _load_pdf(uploaded_file):
+    """Parser for Paytm Passbook PDF (card/column layout, not a real table)."""
     import pdfplumber, pandas as pd, re
 
+    # Defensive: Streamlit's UploadedFile (and any file-like object) keeps
+    # a read cursor. If something upstream (a preview, a hash, another
+    # loader) already read from this object, the cursor sits at EOF and
+    # pdfplumber will see an empty/corrupt stream -> silently 0 pages of
+    # words -> "No transactions found" even though the code is correct.
+    # Rewind defensively before opening.
     try:
         uploaded_file.seek(0)
     except Exception:
@@ -88,6 +108,8 @@ def _load_pdf(uploaded_file):
 
     raw_rows = []
     with pdfplumber.open(uploaded_file) as pdf:
+        # Determine the statement's ending year from the cover page, e.g.
+        # "Statement for 24 JUL'25 - 23 JUL'26" -> end_year = 2026
         header_txt = pdf.pages[0].extract_text() or ""
         m = re.search(r"Statement for\s+\d{1,2}\s\w+'\d{2}\s+-\s+\d{1,2}\s\w+'(\d{2})", header_txt)
         end_year = 2000 + int(m.group(1)) if m else 2025
@@ -97,6 +119,8 @@ def _load_pdf(uploaded_file):
             if not words:
                 continue
 
+            # A new transaction block starts wherever a bare day-number
+            # (e.g. "21") appears in the leftmost (date) column.
             anchors = sorted(set(
                 w['top'] for w in words if w['x0'] < 85 and re.match(r'^\d{1,2}$', w['text'])
             ))
@@ -114,6 +138,9 @@ def _load_pdf(uploaded_file):
 
                 raw_rows.append({k: join_col(v) for k, v in cols.items()})
 
+    # Keep only blocks that actually look like a transaction row: date
+    # column must read "DD Mon ... HH:MM AM/PM" and amount column must
+    # contain "Rs." (this filters out header/footer/summary blocks).
     parsed = []
     for r in raw_rows:
         m = re.match(r'^(\d{1,2})\s([A-Za-z]{3}).*?(\d{1,2}:\d{2}\s?[AP]M)', r['dt'])
@@ -121,22 +148,16 @@ def _load_pdf(uploaded_file):
             continue
         day, mon, time_ = m.group(1), m.group(2), m.group(3)
 
+        # Merchant/description text lives in the "det" column, but also
+        # contains "UPI ID: ..." / "UPI Ref No: ..." / trailing "on"
+        # lines mixed in - strip those out.
         det_text = r['det']
         det_text = re.sub(r'\s*UPI ID:.*?(?=UPI Ref No:|$)', ' ', det_text)
         det_text = re.sub(r'\s*UPI Ref No:.*$', '', det_text)
         det_text = re.sub(r'\bon\b\s*$', '', det_text).strip()
         det_text = re.sub(r'\s+', ' ', det_text)
 
-        # Paytm's "Notes & Tags" column carries two unrelated things: a
-        # real category tag ("Tag: food") or a free-text payment note
-        # ("Note: 5p9bb", "Note: Upi Transaction"). Only a "Tag:" is a
-        # genuine spending category - a "Note:" is arbitrary text (a UPI
-        # note/reference code) and must NOT be treated as a category, or
-        # transactions end up labelled "Note 5p9bb" etc. Keep tags_text
-        # empty for anything that isn't actually a Tag.
-        notes_raw = r['notes'].strip()
-        tag_match = re.match(r'^Tag:\s*(.*)$', notes_raw, flags=re.IGNORECASE)
-        tags_text = tag_match.group(1).strip() if tag_match else ''
+        tags_text = re.sub(r'^Tag:\s*', '', r['notes']).strip()
 
         parsed.append({
             'day': day, 'mon': mon, 'time': time_,
@@ -149,6 +170,10 @@ def _load_pdf(uploaded_file):
     if not parsed:
         raise ValueError("No transactions found in this PDF.")
 
+    # Assign calendar years. Rows come in reverse-chronological order
+    # (newest first). Statement covers two calendar years, so whenever
+    # the month number goes UP compared to the previous row (e.g. Jan
+    # -> Dec), that means we've stepped back into the prior year.
     year = end_year
     prev_month = None
     rows = []
@@ -169,218 +194,18 @@ def _load_pdf(uploaded_file):
 
     return pd.DataFrame(rows)
 
-
-_MONTHS3 = list(_MONTHS.keys())
-
-
-def _detect_pdf_source(uploaded_file, filename):
-    """Figure out which app a PDF statement came from before picking a
-    parser. Every PDF here used to be forced through the Paytm passbook
-    parser regardless of its actual source, which made GPay/PhonePe PDFs
-    fail with "No transactions found in this PDF." We check the PDF's
-    own text first (each app names itself somewhere on page 1, or in
-    GPay's case, in its footer note), and only fall back to the
-    filename if the text check is inconclusive.
-    """
-    try:
-        uploaded_file.seek(0)
-    except Exception:
-        pass
-
-    text = ''
-    try:
-        with pdfplumber.open(uploaded_file) as pdf:
-            if pdf.pages:
-                text = pdf.pages[0].extract_text() or ''
-    except Exception:
-        text = ''
-
-    tl = text.lower()
-    if 'paytm' in tl:
-        return 'Paytm'
-    if 'phonepe' in tl:
-        return 'PhonePe'
-    if re.search(r'google\s*pay', tl):
-        return 'GPay'
-
-    fname = filename.lower()
-    if 'paytm' in fname:
-        return 'Paytm'
-    if 'phonepe' in fname:
-        return 'PhonePe'
-    if 'gpay' in fname or 'google' in fname:
-        return 'GPay'
-    return None
-
-
-def _load_gpay_pdf(uploaded_file):
-    """Parser for Google Pay's 'Transaction statement' PDF.
-
-    Unlike Paytm's passbook PDF, GPay's PDF text stream has no space
-    characters between words in some renders (e.g. "PaidtoBABLU" comes
-    back as one pdfplumber word), so a tight x_tolerance is needed to
-    split tokens by their actual visual gaps. Each transaction is a
-    3-line, 3-column card (Date & time | Transaction details | Amount)
-    repeated down the page, closed off by a per-page footer note - the
-    last block on a page must be clamped to stop at that footer, or its
-    "bottom" (with no next anchor to stop it) swallows the footer text
-    and corrupts the amount (e.g. a trailing "Page 1 of 23" merging its
-    digits into the amount).
-    """
-    try:
-        uploaded_file.seek(0)
-    except Exception:
-        pass
-
-    _COLS = [('dt', 130), ('det', 500), ('amt', float('inf'))]
-
-    def bucket(x0):
-        for name, upper in _COLS:
-            if x0 < upper:
-                return name
-        return 'amt'
-
-    raw_rows = []
-    with pdfplumber.open(uploaded_file) as pdf:
-        for page in pdf.pages:
-            words = page.extract_words(x_tolerance=1)
-            if not words:
-                continue
-
-            footer_tops = [w['top'] for w in words if w['text'] == 'Note:']
-            page_bottom = min(footer_tops) if footer_tops else float('inf')
-
-            anchors = sorted(set(
-                w['top'] for w in words if w['x0'] < 130 and re.match(r'^\d{1,2}$', w['text'])
-            ))
-            for idx, atop in enumerate(anchors):
-                next_top = anchors[idx + 1] if idx + 1 < len(anchors) else float('inf')
-                bottom = min(next_top, page_bottom)
-                block_words = [w for w in words if atop - 1 <= w['top'] < bottom - 1]
-
-                cols = {'dt': [], 'det': [], 'amt': []}
-                for w in block_words:
-                    cols[bucket(w['x0'])].append(w)
-
-                def join_col(ws):
-                    ws = sorted(ws, key=lambda w: (round(w['top']), w['x0']))
-                    return ' '.join(w['text'] for w in ws)
-
-                raw_rows.append({k: join_col(v) for k, v in cols.items()})
-
-    parsed = []
-    for r in raw_rows:
-        m = re.match(
-            r'^(\d{1,2})\s+([A-Za-z]{3}),?\s+(\d{4})\s+(\d{1,2}:\d{2}\s?[AP]M)',
-            r['dt']
-        )
-        if not m or '₹' not in r['amt']:
-            continue
-        day, mon, yr, time_ = m.groups()
-
-        merchant = re.split(r'UPI Transaction ID:', r['det'])[0].strip()
-        merchant = re.sub(r'\s+', ' ', merchant) or 'Unknown'
-
-        amount = re.sub(r'[^\d.]', '', r['amt'])
-
-        parsed.append({
-            'date_raw': f"{day} {mon} {yr}",
-            'time_raw': time_,
-            'merchant': merchant,
-            'amount': amount,
-        })
-
-    if not parsed:
-        raise ValueError("No transactions found in this GPay PDF.")
-
-    return pd.DataFrame(parsed)
-
-
-def _load_phonepe_pdf(uploaded_file):
-    """Parser for PhonePe's 'Transaction Statement' PDF (Date |
-    Transaction Details | Type | Amount columns, each transaction a
-    multi-line card). A block anchor here is a 3-letter month name
-    (e.g. "Dec") in the date column, rather than a bare day number,
-    since PhonePe prints the month first ("Dec 06, 2023"). As with
-    GPay, the last block on a page is clamped at that page's "Page X
-    of Y" footer so it doesn't swallow footer text into the amount.
-    """
-    try:
-        uploaded_file.seek(0)
-    except Exception:
-        pass
-
-    _COLS = [('dt', 130), ('det', 400), ('type', 445), ('amt', float('inf'))]
-
-    def bucket(x0):
-        for name, upper in _COLS:
-            if x0 < upper:
-                return name
-        return 'amt'
-
-    raw_rows = []
-    with pdfplumber.open(uploaded_file) as pdf:
-        for page in pdf.pages:
-            words = page.extract_words(x_tolerance=1)
-            if not words:
-                continue
-
-            footer_tops = [w['top'] for w in words if w['text'] == 'Page' and w['x0'] < 450]
-            page_bottom = min(footer_tops) if footer_tops else float('inf')
-
-            anchors = sorted(set(
-                w['top'] for w in words if w['x0'] < 130 and w['text'] in _MONTHS3
-            ))
-            for idx, atop in enumerate(anchors):
-                next_top = anchors[idx + 1] if idx + 1 < len(anchors) else float('inf')
-                bottom = min(next_top, page_bottom)
-                block_words = [w for w in words if atop - 1 <= w['top'] < bottom - 1]
-
-                cols = {'dt': [], 'det': [], 'type': [], 'amt': []}
-                for w in block_words:
-                    cols[bucket(w['x0'])].append(w)
-
-                def join_col(ws):
-                    ws = sorted(ws, key=lambda w: (round(w['top']), w['x0']))
-                    return ' '.join(w['text'] for w in ws)
-
-                raw_rows.append({k: join_col(v) for k, v in cols.items()})
-
-    parsed = []
-    for r in raw_rows:
-        m = re.match(
-            r'^([A-Za-z]{3})\s+(\d{1,2}),\s+(\d{4})\s+(\d{1,2}:\d{2}\s?[AP]M)',
-            r['dt']
-        )
-        if not m:
-            continue
-        mon, day, yr, time_ = m.groups()
-
-        merchant = r['det'].split('Transaction ID')[0].strip()
-        merchant = re.sub(r'\s+', ' ', merchant) or 'Unknown'
-
-        amt_match = re.search(r'INR\s*([\d,]+\.?\d*)', r['amt'])
-        if not amt_match:
-            continue
-        amount_raw = amt_match.group(1).replace(',', '')
-
-        txn_type_raw = r['type'].strip() or 'Debit'
-
-        parsed.append({
-            'date_raw': f"{day} {mon} {yr}",
-            'time_raw': time_,
-            'merchant': merchant,
-            'amount_raw': amount_raw,
-            'txn_type_raw': txn_type_raw,
-        })
-
-    if not parsed:
-        raise ValueError("No transactions found in this PhonePe PDF.")
-
-    return pd.DataFrame(parsed)
-
+# ── Robust CSV loading (handles preamble/footer junk) ─────────
 
 def _load_messy_csv(uploaded_file):
+    """
+    Some CSV exports (e.g. PhonePe's statement CSV) aren't clean tables:
+    they have metadata lines before the header ("Transaction Statement
+    for +91...", "Duration,...", a blank line) and disclaimer/footer
+    text after the data. Plain pd.read_csv throws a ParserError on
+    these ("Expected 2 fields, saw 8") because it assumes row 1 is the
+    header. This scans for the real header row and the real data
+    rows by field-count, skipping anything else.
+    """
     try:
         uploaded_file.seek(0)
     except Exception:
@@ -410,6 +235,8 @@ def _load_messy_csv(uploaded_file):
             continue
         parts = next(csv.reader([line]))
         if len(parts) != ncols:
+            # First row that doesn't match the header's field count
+            # after data has started = footer/disclaimer text; stop.
             break
         data_rows.append(parts)
 
@@ -419,29 +246,21 @@ def _load_messy_csv(uploaded_file):
     return pd.DataFrame(data_rows, columns=header)
 
 
+# ── File loading ─────────────────────────────────────────────
 def load_file(uploaded_file):
+    """
+    Load CSV (GPay) / XLSX (Paytm/PhonePe) / PDF (any) and return (raw_df, app_name)
+    """
     filename = uploaded_file.name
     fname_lower = filename.lower()
 
     if fname_lower.endswith('.pdf'):
-        # Every PDF used to be forced through the Paytm passbook parser
-        # regardless of which app it actually came from, so a GPay or
-        # PhonePe PDF (different layout entirely) would fail with
-        # "No transactions found in this PDF." Detect the real source
-        # first, then use the parser built for that app's layout.
-        source = _detect_pdf_source(uploaded_file, filename)
-        if source == 'Paytm':
-            df = _load_pdf(uploaded_file)
-        elif source == 'GPay':
-            df = _load_gpay_pdf(uploaded_file)
-        elif source == 'PhonePe':
-            df = _load_phonepe_pdf(uploaded_file)
-        else:
-            raise ValueError(
-                "Could not detect which app this PDF statement is from. "
-                "Supported PDF statements: Paytm, GPay, PhonePe."
-            )
-        return df, source
+        df = _load_pdf(uploaded_file)
+        # _load_pdf already emits Paytm-style columns (date_raw, time_raw,
+        # merchant, amount_raw, tags_raw), so route it through the Paytm
+        # cleaner rather than the generic PDF-table cleaner.
+        app_name = "Paytm"
+        return df, app_name
 
     elif fname_lower.endswith(('.xlsx', '.xls')):
         xl = pd.ExcelFile(uploaded_file)
@@ -467,12 +286,18 @@ def load_file(uploaded_file):
         try:
             df = pd.read_csv(uploaded_file)
         except Exception:
+            # Plain pd.read_csv fails on exports that have metadata
+            # preamble lines and/or disclaimer footer text (e.g.
+            # PhonePe's statement CSV). Fall back to a loader that
+            # locates the real header/data rows by field count.
             df = _load_messy_csv(uploaded_file)
         app_name = detect_app(filename, df)
         return df, app_name
 
 
+# ── Helpers ────────────────────────────────────────────────────
 def _parse_signed_amount(val):
+    """Parse '+20,000.00' or '-100.00' or 'Dr 100.00' into signed float."""
     s = str(val).strip()
     if s == '' or s.lower() == 'nan' or s == '-':
         return np.nan
@@ -488,6 +313,10 @@ def _parse_signed_amount(val):
     elif s.startswith('-'):
         sign = -1
 
+    # Extract just the numeric portion (e.g. "Rs.2,500" -> "2,500",
+    # not ".2500"). Stripping characters blindly left a stray decimal
+    # point from "Rs." attached to the number, silently corrupting
+    # every amount by ~100x (e.g. Rs.2,500 became 0.25).
     m = re.search(r'\d[\d,]*\.?\d*', s)
     if not m:
         return np.nan
@@ -506,7 +335,9 @@ def _clean_paytm_tag(tag):
     return cleaned if cleaned else 'Others'
 
 
+# ── App-specific cleaners ──────────────────────────────────────
 def _clean_gpay(df):
+    """GPay CSV: Date, Time, Transaction, Amount"""
     rename_map = {}
     for c in df.columns:
         cl = c.strip().lower()
@@ -530,23 +361,15 @@ def _clean_gpay(df):
 
     df['amount'] = pd.to_numeric(df['amount'], errors='coerce')
 
-    # GPay's statement explicitly excludes self-transfers ("Self transfer
-    # to <bank>") from its own Sent/Received totals, so they must be
-    # tagged separately here too, not lumped in as Debit spend.
-    def _gpay_direction(x):
-        xl = str(x).strip().lower()
-        if xl.startswith('self transfer'):
-            return 'Self Transfer'
-        if xl.startswith('received'):
-            return 'Credit'
-        return 'Debit'
-
-    df['txn_direction'] = df['merchant'].astype(str).apply(_gpay_direction)
+    df['txn_direction'] = df['merchant'].astype(str).apply(
+        lambda x: 'Credit' if x.lower().startswith('received') else 'Debit'
+    )
     df['category'] = df['merchant'].apply(auto_categorize)
     return df
 
 
 def _clean_paytm(df):
+    """Paytm XLSX 'Passbook Payment History' sheet"""
     rename_map = {}
     for c in df.columns:
         cl = c.strip().lower()
@@ -567,6 +390,10 @@ def _clean_paytm(df):
         lambda x: 'Credit' if x > 0 else ('Debit' if x < 0 else 'Unknown')
     )
 
+    # Self-transfer rows (money moved between the user's own accounts)
+    # have no +/- sign in the PDF and the statement explicitly excludes
+    # them from total money paid/received. Tag them separately so
+    # get_kpis()'s Debit/Credit sums don't double-count them.
     if 'tags_raw' in df.columns:
         is_self = df['tags_raw'].astype(str).str.contains('Self Transfer', case=False, na=False)
         df.loc[is_self, 'txn_direction'] = 'Self Transfer'
@@ -588,16 +415,7 @@ def _clean_paytm(df):
         df['date'] = date_parsed
 
     if 'tags_raw' in df.columns:
-        # tags_raw is empty for rows that had a "Note:" (or nothing) in
-        # the PDF's Notes & Tags column, since _load_pdf only keeps real
-        # "Tag:" values. For those rows, categorize from the merchant
-        # text instead of falling back to a blank/garbage tag.
-        df['category'] = df.apply(
-            lambda r: _clean_paytm_tag(r['tags_raw'])
-            if str(r['tags_raw']).strip() not in ('', 'nan')
-            else auto_categorize(r['merchant']),
-            axis=1
-        )
+        df['category'] = df['tags_raw'].apply(_clean_paytm_tag)
     else:
         df['category'] = df['merchant'].apply(auto_categorize)
 
@@ -605,28 +423,55 @@ def _clean_paytm(df):
 
 
 def _clean_phonepe(df):
+    """PhonePe XLSX/CSV handler"""
+
     df = df.copy()
+
+    # Remove duplicate columns
     df = df.loc[:, ~df.columns.duplicated()]
+
     rename_map = {}
+
     for c in df.columns:
+
         cl = str(c).strip().lower()
+
         if cl == 'date':
             rename_map[c] = 'date_raw'
+
         elif cl == 'time':
             rename_map[c] = 'time_raw'
+
         elif cl == 'amount':
             rename_map[c] = 'amount_raw'
-        elif cl in ['transaction','transaction details','details','remarks','remark']:
+
+        elif cl in [
+            'transaction',
+            'transaction details',
+            'details',
+            'remarks',
+            'remark'
+        ]:
             rename_map[c] = 'merchant'
+
         elif cl in ['type', 'transaction type']:
             rename_map[c] = 'txn_type_raw'
+
     df = df.rename(columns=rename_map)
+
+    # Remove duplicates again after rename
     df = df.loc[:, ~df.columns.duplicated()]
 
     if 'amount_raw' not in df.columns:
-        raise ValueError(f"Amount column not found. Columns are: {list(df.columns)}")
+        raise ValueError(
+            f"Amount column not found. Columns are: {list(df.columns)}"
+        )
+
     if 'date_raw' not in df.columns:
-        raise ValueError(f"Date column not found. Columns are: {list(df.columns)}")
+        raise ValueError(
+            f"Date column not found. Columns are: {list(df.columns)}"
+        )
+
     if 'merchant' not in df.columns:
         df['merchant'] = 'Unknown'
 
@@ -634,34 +479,69 @@ def _clean_phonepe(df):
     if 'time_raw' in df.columns:
         df['time_raw'] = df['time_raw'].astype(str).str.strip()
 
-    df['amount'] = df['amount_raw'].apply(_parse_signed_amount).abs()
+    df['amount'] = (
+        df['amount_raw']
+        .apply(_parse_signed_amount)
+        .abs()
+    )
 
-    date_parsed = pd.to_datetime(df['date_raw'], format='%Y-%m-%d', errors='coerce')
+    # Try the unambiguous ISO format first. dayfirst=True actively
+    # misparses ISO 'YYYY-MM-DD' strings (it swaps month/day), turning
+    # e.g. "2022-10-13" into NaT once the swapped "day" (13) can't be a
+    # valid month - silently dropping hundreds of otherwise-good rows.
+    date_parsed = pd.to_datetime(
+        df['date_raw'],
+        format='%Y-%m-%d',
+        errors='coerce'
+    )
     if date_parsed.isna().mean() > 0.5:
-        date_parsed = pd.to_datetime(df['date_raw'], errors='coerce', dayfirst=True)
+        date_parsed = pd.to_datetime(
+            df['date_raw'],
+            errors='coerce',
+            dayfirst=True
+        )
 
     if 'time_raw' in df.columns:
+
         df['date'] = pd.to_datetime(
-            date_parsed.dt.strftime('%Y-%m-%d') + ' ' + df['time_raw'].astype(str),
+            date_parsed.dt.strftime('%Y-%m-%d')
+            + ' '
+            + df['time_raw'].astype(str),
             errors='coerce'
         )
+
         mask = df['date'].isna()
         df.loc[mask, 'date'] = date_parsed[mask]
+
     else:
         df['date'] = date_parsed
 
     if 'txn_type_raw' in df.columns:
-        df['txn_direction'] = df['txn_type_raw'].astype(str).apply(
-            lambda x: 'Credit' if 'credit' in x.lower() else 'Debit'
+
+        df['txn_direction'] = (
+            df['txn_type_raw']
+            .astype(str)
+            .apply(
+                lambda x:
+                'Credit'
+                if 'credit' in x.lower()
+                else 'Debit'
+            )
         )
+
     else:
         df['txn_direction'] = 'Debit'
 
     df['category'] = df['merchant'].apply(auto_categorize)
+
     return df
 
 
 def _clean_google_play(df):
+    """Google Play purchase history CSV:
+    Time, Transaction ID, Description, Product, Payment method, Status, Amount
+    e.g. Time="Jan 12, 2026, 4:31 AM", Amount="INR 299.00"
+    """
     df = df.copy()
     rename_map = {}
     for c in df.columns:
@@ -678,13 +558,20 @@ def _clean_google_play(df):
             rename_map[c] = 'product'
     df = df.rename(columns=rename_map)
 
+    # "Jan 12, 2026, 4:31 AM" -> parse directly, no separate time column
     df['date'] = pd.to_datetime(df['date_raw'], errors='coerce')
 
     df['amount_signed'] = df['amount_raw'].apply(_parse_signed_amount)
     df['amount'] = df['amount_signed'].abs()
 
+    # Google Play purchases are always money going out (Debit); there is
+    # no credit side to this export.
     df['txn_direction'] = 'Debit'
 
+    # Normalize Complete/Cancelled/Failed into the Success/Failed
+    # vocabulary get_kpis() looks for (it matches on 'success'/'fail'
+    # substrings), otherwise every row here would silently show up as
+    # 0% success rate and 0 failed count.
     if 'status_raw' in df.columns:
         def norm_status(s):
             s = str(s).strip().lower()
@@ -706,9 +593,14 @@ def _clean_google_play(df):
 
 
 def _clean_pdf_generic(df):
+    """
+    Generic cleaner for PDF-extracted tables.
+    Tries to find date, amount, and description columns by name/content.
+    """
     df = df.copy()
     df.columns = [str(c).strip().lower() for c in df.columns]
 
+    # Find date column
     date_col = None
     for c in df.columns:
         if 'date' in c:
@@ -717,6 +609,7 @@ def _clean_pdf_generic(df):
     if date_col is None:
         date_col = df.columns[0]
 
+    # Find amount column
     amount_col = None
     for c in df.columns:
         if 'amount' in c or 'amt' in c or 'debit' in c or 'credit' in c:
@@ -725,6 +618,7 @@ def _clean_pdf_generic(df):
     if amount_col is None:
         amount_col = df.columns[-1]
 
+    # Find description column
     desc_col = None
     for c in df.columns:
         if any(k in c for k in ['transaction', 'description', 'particular', 'detail', 'remark', 'narration']):
@@ -764,12 +658,20 @@ def _clean_pdf_generic(df):
     return out
 
 
+# ── Main cleaning entry point ──────────────────────────────────
 def clean_data(df, app_name):
     df = df.copy()
+
+    # Clean column names
     df.columns = [str(c).strip() for c in df.columns]
+
+    # Remove duplicate columns
     df = df.loc[:, ~df.columns.duplicated()]
+
+    # Reset index
     df = df.reset_index(drop=True)
 
+    # Debug (remove later)
     print("APP:", app_name)
     print("COLUMNS:", df.columns.tolist())
 
@@ -784,9 +686,11 @@ def clean_data(df, app_name):
     else:
         df = _clean_gpay(df)
 
+    # Remove duplicate columns again after renaming
     df = df.loc[:, ~df.columns.duplicated()]
     df = df.reset_index(drop=True)
 
+    # Required columns check
     required_cols = ['date', 'amount']
     for col in required_cols:
         if col not in df.columns:
@@ -814,7 +718,10 @@ def clean_data(df, app_name):
     df['status'] = df['status'].fillna('Success')
 
     if 'transaction_id' not in df.columns:
-        df['transaction_id'] = [f"TXN{str(i).zfill(6)}" for i in range(len(df))]
+        df['transaction_id'] = [
+            f"TXN{str(i).zfill(6)}"
+            for i in range(len(df))
+        ]
 
     if len(df) > 0:
         Q1 = df['amount'].quantile(0.25)
@@ -824,8 +731,19 @@ def clean_data(df, app_name):
     else:
         df['is_anomaly'] = False
 
-    keep_cols = ['transaction_id','date','hour','day_of_week','month','month_num',
-                 'amount','merchant','category','status','is_anomaly']
+    keep_cols = [
+        'transaction_id',
+        'date',
+        'hour',
+        'day_of_week',
+        'month',
+        'month_num',
+        'amount',
+        'merchant',
+        'category',
+        'status',
+        'is_anomaly'
+    ]
 
     if 'txn_direction' in df.columns:
         keep_cols.append('txn_direction')
@@ -835,6 +753,7 @@ def clean_data(df, app_name):
     return df[keep_cols].reset_index(drop=True)
 
 
+# ── Aggregation helpers ─────────────────────────────────────────
 def get_kpis(df):
     success_df = df[df['status'].astype(str).str.lower().str.contains('success', na=False)]
     has_dir = 'txn_direction' in df.columns
@@ -850,3 +769,55 @@ def get_kpis(df):
         'success_rate':       round(success_df.shape[0] / len(df) * 100, 1) if len(df) else 0,
         'failed_count':       int(df['status'].astype(str).str.lower().str.contains('fail', na=False).sum()),
     }
+
+
+def get_heatmap_data(df):
+    order = ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday']
+    df = df.copy()
+    df['day_of_week'] = pd.Categorical(df['day_of_week'], categories=order, ordered=True)
+    return (
+        df.groupby(['day_of_week','hour'], observed=False)['amount']
+        .sum().reset_index()
+        .pivot(index='day_of_week', columns='hour', values='amount')
+        .fillna(0)
+    )
+
+
+def get_category_data(df):
+    return (
+        df.groupby('category')
+        .agg(total_amount=('amount','sum'), count=('amount','count'))
+        .reset_index().sort_values('total_amount', ascending=False)
+    )
+
+
+def get_merchant_data(df, top_n=10):
+    return (
+        df.groupby('merchant')
+        .agg(total_amount=('amount','sum'), count=('amount','count'))
+        .reset_index().sort_values('total_amount', ascending=False)
+        .head(top_n)
+    )
+
+
+def get_monthly_trend(df):
+    return (
+        df.groupby(['month_num','month'])['amount']
+        .sum().reset_index().sort_values('month_num')
+    )
+
+
+def get_daily_trend(df):
+    out = df.groupby(df['date'].dt.date)['amount'].sum().reset_index()
+    out.columns = ['date', 'amount']
+    return out
+
+
+def get_status_data(df):
+    return df['status'].value_counts().reset_index()
+
+
+def get_anomalies(df):
+    cols = ['transaction_id','date','merchant','category','amount','status']
+    cols = [c for c in cols if c in df.columns]
+    return df[df['is_anomaly']][cols].sort_values('amount', ascending=False)
