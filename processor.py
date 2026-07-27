@@ -170,6 +170,216 @@ def _load_pdf(uploaded_file):
     return pd.DataFrame(rows)
 
 
+_MONTHS3 = list(_MONTHS.keys())
+
+
+def _detect_pdf_source(uploaded_file, filename):
+    """Figure out which app a PDF statement came from before picking a
+    parser. Every PDF here used to be forced through the Paytm passbook
+    parser regardless of its actual source, which made GPay/PhonePe PDFs
+    fail with "No transactions found in this PDF." We check the PDF's
+    own text first (each app names itself somewhere on page 1, or in
+    GPay's case, in its footer note), and only fall back to the
+    filename if the text check is inconclusive.
+    """
+    try:
+        uploaded_file.seek(0)
+    except Exception:
+        pass
+
+    text = ''
+    try:
+        with pdfplumber.open(uploaded_file) as pdf:
+            if pdf.pages:
+                text = pdf.pages[0].extract_text() or ''
+    except Exception:
+        text = ''
+
+    tl = text.lower()
+    if 'paytm' in tl:
+        return 'Paytm'
+    if 'phonepe' in tl:
+        return 'PhonePe'
+    if re.search(r'google\s*pay', tl):
+        return 'GPay'
+
+    fname = filename.lower()
+    if 'paytm' in fname:
+        return 'Paytm'
+    if 'phonepe' in fname:
+        return 'PhonePe'
+    if 'gpay' in fname or 'google' in fname:
+        return 'GPay'
+    return None
+
+
+def _load_gpay_pdf(uploaded_file):
+    """Parser for Google Pay's 'Transaction statement' PDF.
+
+    Unlike Paytm's passbook PDF, GPay's PDF text stream has no space
+    characters between words in some renders (e.g. "PaidtoBABLU" comes
+    back as one pdfplumber word), so a tight x_tolerance is needed to
+    split tokens by their actual visual gaps. Each transaction is a
+    3-line, 3-column card (Date & time | Transaction details | Amount)
+    repeated down the page, closed off by a per-page footer note - the
+    last block on a page must be clamped to stop at that footer, or its
+    "bottom" (with no next anchor to stop it) swallows the footer text
+    and corrupts the amount (e.g. a trailing "Page 1 of 23" merging its
+    digits into the amount).
+    """
+    try:
+        uploaded_file.seek(0)
+    except Exception:
+        pass
+
+    _COLS = [('dt', 130), ('det', 500), ('amt', float('inf'))]
+
+    def bucket(x0):
+        for name, upper in _COLS:
+            if x0 < upper:
+                return name
+        return 'amt'
+
+    raw_rows = []
+    with pdfplumber.open(uploaded_file) as pdf:
+        for page in pdf.pages:
+            words = page.extract_words(x_tolerance=1)
+            if not words:
+                continue
+
+            footer_tops = [w['top'] for w in words if w['text'] == 'Note:']
+            page_bottom = min(footer_tops) if footer_tops else float('inf')
+
+            anchors = sorted(set(
+                w['top'] for w in words if w['x0'] < 130 and re.match(r'^\d{1,2}$', w['text'])
+            ))
+            for idx, atop in enumerate(anchors):
+                next_top = anchors[idx + 1] if idx + 1 < len(anchors) else float('inf')
+                bottom = min(next_top, page_bottom)
+                block_words = [w for w in words if atop - 1 <= w['top'] < bottom - 1]
+
+                cols = {'dt': [], 'det': [], 'amt': []}
+                for w in block_words:
+                    cols[bucket(w['x0'])].append(w)
+
+                def join_col(ws):
+                    ws = sorted(ws, key=lambda w: (round(w['top']), w['x0']))
+                    return ' '.join(w['text'] for w in ws)
+
+                raw_rows.append({k: join_col(v) for k, v in cols.items()})
+
+    parsed = []
+    for r in raw_rows:
+        m = re.match(
+            r'^(\d{1,2})\s+([A-Za-z]{3}),?\s+(\d{4})\s+(\d{1,2}:\d{2}\s?[AP]M)',
+            r['dt']
+        )
+        if not m or '₹' not in r['amt']:
+            continue
+        day, mon, yr, time_ = m.groups()
+
+        merchant = re.split(r'UPI Transaction ID:', r['det'])[0].strip()
+        merchant = re.sub(r'\s+', ' ', merchant) or 'Unknown'
+
+        amount = re.sub(r'[^\d.]', '', r['amt'])
+
+        parsed.append({
+            'date_raw': f"{day} {mon} {yr}",
+            'time_raw': time_,
+            'merchant': merchant,
+            'amount': amount,
+        })
+
+    if not parsed:
+        raise ValueError("No transactions found in this GPay PDF.")
+
+    return pd.DataFrame(parsed)
+
+
+def _load_phonepe_pdf(uploaded_file):
+    """Parser for PhonePe's 'Transaction Statement' PDF (Date |
+    Transaction Details | Type | Amount columns, each transaction a
+    multi-line card). A block anchor here is a 3-letter month name
+    (e.g. "Dec") in the date column, rather than a bare day number,
+    since PhonePe prints the month first ("Dec 06, 2023"). As with
+    GPay, the last block on a page is clamped at that page's "Page X
+    of Y" footer so it doesn't swallow footer text into the amount.
+    """
+    try:
+        uploaded_file.seek(0)
+    except Exception:
+        pass
+
+    _COLS = [('dt', 130), ('det', 400), ('type', 445), ('amt', float('inf'))]
+
+    def bucket(x0):
+        for name, upper in _COLS:
+            if x0 < upper:
+                return name
+        return 'amt'
+
+    raw_rows = []
+    with pdfplumber.open(uploaded_file) as pdf:
+        for page in pdf.pages:
+            words = page.extract_words(x_tolerance=1)
+            if not words:
+                continue
+
+            footer_tops = [w['top'] for w in words if w['text'] == 'Page' and w['x0'] < 450]
+            page_bottom = min(footer_tops) if footer_tops else float('inf')
+
+            anchors = sorted(set(
+                w['top'] for w in words if w['x0'] < 130 and w['text'] in _MONTHS3
+            ))
+            for idx, atop in enumerate(anchors):
+                next_top = anchors[idx + 1] if idx + 1 < len(anchors) else float('inf')
+                bottom = min(next_top, page_bottom)
+                block_words = [w for w in words if atop - 1 <= w['top'] < bottom - 1]
+
+                cols = {'dt': [], 'det': [], 'type': [], 'amt': []}
+                for w in block_words:
+                    cols[bucket(w['x0'])].append(w)
+
+                def join_col(ws):
+                    ws = sorted(ws, key=lambda w: (round(w['top']), w['x0']))
+                    return ' '.join(w['text'] for w in ws)
+
+                raw_rows.append({k: join_col(v) for k, v in cols.items()})
+
+    parsed = []
+    for r in raw_rows:
+        m = re.match(
+            r'^([A-Za-z]{3})\s+(\d{1,2}),\s+(\d{4})\s+(\d{1,2}:\d{2}\s?[AP]M)',
+            r['dt']
+        )
+        if not m:
+            continue
+        mon, day, yr, time_ = m.groups()
+
+        merchant = r['det'].split('Transaction ID')[0].strip()
+        merchant = re.sub(r'\s+', ' ', merchant) or 'Unknown'
+
+        amt_match = re.search(r'INR\s*([\d,]+\.?\d*)', r['amt'])
+        if not amt_match:
+            continue
+        amount_raw = amt_match.group(1).replace(',', '')
+
+        txn_type_raw = r['type'].strip() or 'Debit'
+
+        parsed.append({
+            'date_raw': f"{day} {mon} {yr}",
+            'time_raw': time_,
+            'merchant': merchant,
+            'amount_raw': amount_raw,
+            'txn_type_raw': txn_type_raw,
+        })
+
+    if not parsed:
+        raise ValueError("No transactions found in this PhonePe PDF.")
+
+    return pd.DataFrame(parsed)
+
+
 def _load_messy_csv(uploaded_file):
     try:
         uploaded_file.seek(0)
@@ -214,9 +424,24 @@ def load_file(uploaded_file):
     fname_lower = filename.lower()
 
     if fname_lower.endswith('.pdf'):
-        df = _load_pdf(uploaded_file)
-        app_name = "Paytm"
-        return df, app_name
+        # Every PDF used to be forced through the Paytm passbook parser
+        # regardless of which app it actually came from, so a GPay or
+        # PhonePe PDF (different layout entirely) would fail with
+        # "No transactions found in this PDF." Detect the real source
+        # first, then use the parser built for that app's layout.
+        source = _detect_pdf_source(uploaded_file, filename)
+        if source == 'Paytm':
+            df = _load_pdf(uploaded_file)
+        elif source == 'GPay':
+            df = _load_gpay_pdf(uploaded_file)
+        elif source == 'PhonePe':
+            df = _load_phonepe_pdf(uploaded_file)
+        else:
+            raise ValueError(
+                "Could not detect which app this PDF statement is from. "
+                "Supported PDF statements: Paytm, GPay, PhonePe."
+            )
+        return df, source
 
     elif fname_lower.endswith(('.xlsx', '.xls')):
         xl = pd.ExcelFile(uploaded_file)
@@ -305,9 +530,18 @@ def _clean_gpay(df):
 
     df['amount'] = pd.to_numeric(df['amount'], errors='coerce')
 
-    df['txn_direction'] = df['merchant'].astype(str).apply(
-        lambda x: 'Credit' if x.lower().startswith('received') else 'Debit'
-    )
+    # GPay's statement explicitly excludes self-transfers ("Self transfer
+    # to <bank>") from its own Sent/Received totals, so they must be
+    # tagged separately here too, not lumped in as Debit spend.
+    def _gpay_direction(x):
+        xl = str(x).strip().lower()
+        if xl.startswith('self transfer'):
+            return 'Self Transfer'
+        if xl.startswith('received'):
+            return 'Credit'
+        return 'Debit'
+
+    df['txn_direction'] = df['merchant'].astype(str).apply(_gpay_direction)
     df['category'] = df['merchant'].apply(auto_categorize)
     return df
 
